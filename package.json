@@ -1,0 +1,16 @@
+{
+  "name": "swipetest",
+  "version": "1.0.0",
+  "description": "Phone-friendly swipe visualizer with Express and Tailwind CSS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

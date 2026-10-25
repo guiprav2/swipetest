@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>Swipe Arrows</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      html,
+      body {
+        height: 100%;
+        overscroll-behavior: none;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+
+      #swipe-layer {
+        touch-action: none;
+      }
+
+      .swipe-svg {
+        width: 64px;
+        height: 64px;
+        flex: 0 0 64px;
+      }
+    </style>
+  </head>
+  <body class="bg-slate-950 text-slate-100 antialiased">
+    <div
+      id="swipe-layer"
+      class="fixed inset-0 z-10 flex min-h-[100dvh] flex-col"
+    >
+      <header
+        class="pointer-events-none flex shrink-0 items-center justify-between gap-3 px-4 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]"
+      >
+        <div>
+          <h1 class="text-sm font-semibold tracking-wide text-slate-100">
+            Swipe anywhere
+          </h1>
+          <p class="text-xs text-slate-400">
+            Newest arrows appear at the top
+          </p>
+        </div>
+        <button
+          id="clear-btn"
+          type="button"
+          class="pointer-events-auto rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5 text-xs font-medium text-slate-200 backdrop-blur active:bg-slate-800"
+        >
+          Clear
+        </button>
+      </header>
+
+      <main
+        id="gallery"
+        class="pointer-events-none flex flex-1 flex-wrap content-start gap-2 overflow-y-auto px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+        aria-live="polite"
+      ></main>
+
+      <p
+        id="hint"
+        class="pointer-events-none absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-slate-500"
+      >
+        Swipe on the screen to capture gestures
+      </p>
+
+      <svg
+        id="live-trail"
+        class="pointer-events-none absolute inset-0 h-full w-full"
+        xmlns="http://www.w3.org/2000/svg"
+      ></svg>
+    </div>
+
+    <script>
+      const SVG_SIZE = 64;
+      const PAD = 8;
+      const MIN_POINTS = 2;
+      const MIN_DISTANCE = 12;
+
+      const gallery = document.getElementById("gallery");
+      const hint = document.getElementById("hint");
+      const clearBtn = document.getElementById("clear-btn");
+      const liveTrail = document.getElementById("live-trail");
+      const layer = document.getElementById("swipe-layer");
+
+      /** @type {{x:number,y:number}[]} */
+      let activePoints = [];
+      /** @type {{x:number,y:number}[][]} */
+      let swipes = [];
+      let pointerId = null;
+      // Prefer Pointer Events when the browser emits them; skip Touch Event
+      // handlers in that case so paths are not recorded twice.
+      let usingPointerEvents = false;
+
+      function dist(a, b) {
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        return Math.hypot(dx, dy);
+      }
+
+      function pathLength(points) {
+        let len = 0;
+        for (let i = 1; i < points.length; i++) {
+          len += dist(points[i - 1], points[i]);
+        }
+        return len;
+      }
+
+      function boundsOf(points) {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const p of points) {
+          if (p.x < minX) minX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y > maxY) maxY = p.y;
+        }
+        return { minX, minY, maxX, maxY };
+      }
+
+      /**
+       * Shared scale across all swipes so longer gestures look longer
+       * than shorter ones inside the 64x64 tiles.
+       */
+      function sharedScale(allSwipes) {
+        let maxExtent = 1;
+        for (const points of allSwipes) {
+          const b = boundsOf(points);
+          const w = Math.max(b.maxX - b.minX, 1);
+          const h = Math.max(b.maxY - b.minY, 1);
+          maxExtent = Math.max(maxExtent, w, h);
+        }
+        const inner = SVG_SIZE - PAD * 2;
+        return inner / maxExtent;
+      }
+
+      function projectPoints(points, scale) {
+        const b = boundsOf(points);
+        const w = Math.max(b.maxX - b.minX, 1);
+        const h = Math.max(b.maxY - b.minY, 1);
+        const drawnW = w * scale;
+        const drawnH = h * scale;
+        const offsetX = (SVG_SIZE - drawnW) / 2 - b.minX * scale;
+        const offsetY = (SVG_SIZE - drawnH) / 2 - b.minY * scale;
+        return points.map((p) => ({
+          x: p.x * scale + offsetX,
+          y: p.y * scale + offsetY,
+        }));
+      }
+
+      function polylinePointsAttr(points) {
+        return points.map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ");
+      }
+
+      function arrowHead(points) {
+        if (points.length < 2) return null;
+        const tip = points[points.length - 1];
+        let base = points[points.length - 2];
+        for (let i = points.length - 2; i >= 0; i--) {
+          if (dist(points[i], tip) >= 4) {
+            base = points[i];
+            break;
+          }
+        }
+        const angle = Math.atan2(tip.y - base.y, tip.x - base.x);
+        const size = 7;
+        const left = {
+          x: tip.x - size * Math.cos(angle - Math.PI / 6),
+          y: tip.y - size * Math.sin(angle - Math.PI / 6),
+        };
+        const right = {
+          x: tip.x - size * Math.cos(angle + Math.PI / 6),
+          y: tip.y - size * Math.sin(angle + Math.PI / 6),
+        };
+        return { tip, left, right };
+      }
+
+      function buildSwipeSvg(points, scale, index) {
+        const projected = projectPoints(points, scale);
+        const head = arrowHead(projected);
+        const ns = "http://www.w3.org/2000/svg";
+        const svg = document.createElementNS(ns, "svg");
+        svg.setAttribute("viewBox", `0 0 ${SVG_SIZE} ${SVG_SIZE}`);
+        svg.setAttribute("width", String(SVG_SIZE));
+        svg.setAttribute("height", String(SVG_SIZE));
+        svg.setAttribute(
+          "class",
+          "swipe-svg rounded-lg border border-slate-700/80 bg-slate-900/90 shadow-sm"
+        );
+        svg.setAttribute("aria-label", `Swipe ${index + 1}`);
+
+        const bg = document.createElementNS(ns, "rect");
+        bg.setAttribute("width", String(SVG_SIZE));
+        bg.setAttribute("height", String(SVG_SIZE));
+        bg.setAttribute("rx", "8");
+        bg.setAttribute("fill", "transparent");
+        svg.appendChild(bg);
+
+        const poly = document.createElementNS(ns, "polyline");
+        poly.setAttribute("points", polylinePointsAttr(projected));
+        poly.setAttribute("fill", "none");
+        poly.setAttribute("stroke", "#38bdf8");
+        poly.setAttribute("stroke-width", "2.5");
+        poly.setAttribute("stroke-linecap", "round");
+        poly.setAttribute("stroke-linejoin", "round");
+        svg.appendChild(poly);
+
+        if (head) {
+          const arrow = document.createElementNS(ns, "polygon");
+          arrow.setAttribute(
+            "points",
+            [
+              `${head.tip.x.toFixed(2)},${head.tip.y.toFixed(2)}`,
+              `${head.left.x.toFixed(2)},${head.left.y.toFixed(2)}`,
+              `${head.right.x.toFixed(2)},${head.right.y.toFixed(2)}`,
+            ].join(" ")
+          );
+          arrow.setAttribute("fill", "#7dd3fc");
+          svg.appendChild(arrow);
+        }
+
+        return svg;
+      }
+
+      function renderGallery() {
+        gallery.replaceChildren();
+        hint.classList.toggle("hidden", swipes.length > 0);
+        if (swipes.length === 0) return;
+
+        const scale = sharedScale(swipes);
+        // Newest first: reverse display order; swipes[0] is oldest.
+        for (let i = swipes.length - 1; i >= 0; i--) {
+          gallery.appendChild(buildSwipeSvg(swipes[i], scale, i));
+        }
+      }
+
+      function clearLiveTrail() {
+        liveTrail.replaceChildren();
+      }
+
+      function drawLiveTrail(points) {
+        clearLiveTrail();
+        if (points.length < 2) return;
+        const ns = "http://www.w3.org/2000/svg";
+        const poly = document.createElementNS(ns, "polyline");
+        poly.setAttribute("points", polylinePointsAttr(points));
+        poly.setAttribute("fill", "none");
+        poly.setAttribute("stroke", "rgba(56, 189, 248, 0.85)");
+        poly.setAttribute("stroke-width", "3");
+        poly.setAttribute("stroke-linecap", "round");
+        poly.setAttribute("stroke-linejoin", "round");
+        liveTrail.appendChild(poly);
+      }
+
+      function pointFromEvent(e) {
+        if (e.touches && e.touches.length) {
+          return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        }
+        if (e.changedTouches && e.changedTouches.length) {
+          return {
+            x: e.changedTouches[0].clientX,
+            y: e.changedTouches[0].clientY,
+          };
+        }
+        return { x: e.clientX, y: e.clientY };
+      }
+
+      function beginStroke(e) {
+        if (pointerId !== null) return;
+        if (e.target.closest && e.target.closest("#clear-btn")) return;
+        if (e.pointerId !== undefined) {
+          usingPointerEvents = true;
+          pointerId = e.pointerId;
+        } else {
+          pointerId = "touch";
+        }
+        activePoints = [pointFromEvent(e)];
+        drawLiveTrail(activePoints);
+        if (e.pointerId !== undefined && layer.setPointerCapture) {
+          try {
+            layer.setPointerCapture(e.pointerId);
+          } catch (_) {}
+        }
+      }
+
+      function moveStroke(e) {
+        if (pointerId === null) return;
+        if (
+          e.pointerId !== undefined &&
+          pointerId !== "touch" &&
+          e.pointerId !== pointerId
+        ) {
+          return;
+        }
+        const p = pointFromEvent(e);
+        const last = activePoints[activePoints.length - 1];
+        if (!last || dist(last, p) >= 2) {
+          activePoints.push(p);
+          drawLiveTrail(activePoints);
+        }
+      }
+
+      function endStroke(e) {
+        if (pointerId === null) return;
+        if (
+          e.pointerId !== undefined &&
+          pointerId !== "touch" &&
+          e.pointerId !== pointerId
+        ) {
+          return;
+        }
+        if (e.type === "pointercancel" || e.type === "touchcancel") {
+          activePoints = [];
+          pointerId = null;
+          clearLiveTrail();
+          return;
+        }
+        const p = pointFromEvent(e);
+        const last = activePoints[activePoints.length - 1];
+        if (!last || dist(last, p) >= 1) {
+          activePoints.push(p);
+        }
+
+        const ok =
+          activePoints.length >= MIN_POINTS &&
+          pathLength(activePoints) >= MIN_DISTANCE;
+
+        if (ok) {
+          swipes.push(activePoints.map((pt) => ({ x: pt.x, y: pt.y })));
+          renderGallery();
+        }
+
+        activePoints = [];
+        pointerId = null;
+        clearLiveTrail();
+      }
+
+      // Pointer events cover mouse + touch on modern mobile browsers.
+      layer.addEventListener("pointerdown", beginStroke, { passive: false });
+      layer.addEventListener("pointermove", moveStroke, { passive: false });
+      layer.addEventListener("pointerup", endStroke, { passive: false });
+      layer.addEventListener("pointercancel", endStroke, { passive: false });
+
+      // Fallback for older WebViews without Pointer Events.
+      layer.addEventListener(
+        "touchstart",
+        (e) => {
+          if (e.target.closest && e.target.closest("#clear-btn")) return;
+          e.preventDefault();
+          if (usingPointerEvents) return;
+          beginStroke(e);
+        },
+        { passive: false }
+      );
+      layer.addEventListener(
+        "touchmove",
+        (e) => {
+          e.preventDefault();
+          if (usingPointerEvents) return;
+          moveStroke(e);
+        },
+        { passive: false }
+      );
+      layer.addEventListener(
+        "touchend",
+        (e) => {
+          e.preventDefault();
+          if (usingPointerEvents) return;
+          endStroke(e);
+        },
+        { passive: false }
+      );
+      layer.addEventListener(
+        "touchcancel",
+        (e) => {
+          if (usingPointerEvents) return;
+          endStroke(e);
+        },
+        { passive: false }
+      );
+
+      clearBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        swipes = [];
+        activePoints = [];
+        pointerId = null;
+        clearLiveTrail();
+        renderGallery();
+      });
+
+      clearBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+
+      // Prevent pull-to-refresh / rubber-banding while swiping.
+      document.addEventListener(
+        "touchmove",
+        (e) => {
+          if (e.target.closest && e.target.closest("#clear-btn")) return;
+          e.preventDefault();
+        },
+        { passive: false }
+      );
+    </script>
+  </body>
+</html>
